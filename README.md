@@ -12,6 +12,21 @@
 
 </div>
 
+> [!IMPORTANT]
+> **This fork: FP16 fast path for Qwen 3.8 Flash Next on M1/M2 Macs.**
+> M1 and M2 GPUs have no native BF16. Upstream MTPLX refuses FP16 packs (`mtplx forge fp16`) on the Flash-Next fixed-M4 verify lane (`QSA fused K/V gather requires BF16`). Branch [`fp16-fixed-m4`](https://github.com/MikeT-Lab/MTPLX/tree/fp16-fixed-m4) makes those kernels serve BF16 *or* FP16 streams. BF16 packs run byte-identical kernels; every changed kernel is bit-exact against the stock MLX chain in both dtypes (27 new tests).
+>
+> Measured on a Mac Studio M2 Ultra (76-core GPU, 128 GB), Qwen3.8-Flash-Next GSQ-RCO Q2, same code, BF16 pack vs its FP16 forge, depth 3, 4 alternating boots, 2026-11-24:
+>
+> | | BF16 | FP16 | |
+> |---|---|---|---|
+> | Prefill, 4.3k prompt | 774 tok/s | 1006 tok/s | **+30%** |
+> | Prefill, 56k prompt | 690 tok/s | 880 tok/s | **+28%** |
+> | Time to first token, 56k | 81.8 s | 64.1 s | **−22%** |
+> | Decode, 4.3k / 56k | 50.5 / 47.1 tok/s | 56.9 / 52.3 tok/s | +13% / +11% (noisy) |
+>
+> Full protocol, test results and limitations: [youssofal/MTPLX#720](https://github.com/youssofal/MTPLX/issues/720). Everything below is the upstream README.
+
 MTPLX is a native Mac app and a command line that runs local language models on Apple Silicon with the model's own multi-token prediction (MTP) heads. It runs Inkling 2 Mini on MTPLX's own Metal kernels, Qwen 3.8 Flash Next, the 125B mixture of experts, Qwen 3.8 27B and Prism ML's Ternary Bonsai 2 27B, plus Qwen 3.6, Qwen 3.5 and Gemma 4. The model drafts several tokens ahead of itself, one batched forward pass verifies the draft, and tokens are committed through exact rejection sampling with residual correction. The sampler works at the model's native temperature, and decode runs at around twice the speed of plain decoding: measured 1.6x on a 16 GB M4 Mac mini and 2.24x on an M5 Max.
 
 ## Measured speeds
