@@ -157,6 +157,8 @@ from typing import Any, Callable
 
 import mlx.core as mx
 
+from .qwen4_stream_dtype import SUPPORTED_STREAM_DTYPES, kernel_suffix, specialize
+
 ROWS = 4
 TOP_K = 10
 HIDDEN = 2560
@@ -194,8 +196,8 @@ TAIL_THREADS = NUM_EXPERTS // SOFTMAX_N_READS  # 128
 EAGER_DISPATCHES_PER_LAYER = 10
 FUSED_DISPATCHES_PER_LAYER = 2
 
-_LOGITS_KERNEL: Any | None = None
-_TAIL_KERNEL: Any | None = None
+#: Compiled (logits, tail) kernels per stream dtype; BF16 keeps the original names.
+_KERNELS: dict[Any, tuple[Any, Any]] = {}
 
 
 def router_bytes_per_layer() -> int:
@@ -574,8 +576,8 @@ def check_contract(block: Any, *, index: int) -> None:
         meta_shape = (weight_shape[0], GROUPS_PER_ROW)
         for field, arr, want, dtype in (
             ("weight", weight, weight_shape, mx.uint32),
-            ("scales", scales, meta_shape, mx.bfloat16),
-            ("biases", biases, meta_shape, mx.bfloat16),
+            ("scales", scales, meta_shape, scales.dtype),
+            ("biases", biases, meta_shape, scales.dtype),
         ):
             if tuple(arr.shape) != want:
                 raise ValueError(
@@ -585,6 +587,11 @@ def check_contract(block: Any, *, index: int) -> None:
             if arr.dtype != dtype:
                 raise ValueError(
                     f"{label}: {name}.{field} dtype {arr.dtype} (want {dtype})"
+                )
+            if field != "weight" and arr.dtype not in SUPPORTED_STREAM_DTYPES:
+                raise ValueError(
+                    f"{label}: {name}.{field} dtype {arr.dtype} "
+                    "(want bfloat16, or float16 on an FP16 pack)"
                 )
 
 
@@ -599,9 +606,10 @@ def check_input(x: mx.array) -> None:
             f"MTPLX_QWEN4_ROUTE_KERNEL is wired for exactly [{ROWS}, {HIDDEN}]; "
             f"got {tuple(x.shape)}"
         )
-    if x.dtype != mx.bfloat16:
+    if x.dtype not in SUPPORTED_STREAM_DTYPES:
         raise ValueError(
-            f"MTPLX_QWEN4_ROUTE_KERNEL: hidden dtype {x.dtype} (want bfloat16)"
+            f"MTPLX_QWEN4_ROUTE_KERNEL: hidden dtype {x.dtype} "
+            "(want bfloat16, or float16 on an FP16 pack)"
         )
 
 
@@ -619,37 +627,39 @@ def bind(vec_lanes: int = DEFAULT_VEC_LANES) -> Callable[..., tuple]:
             f"route kernel vec_lanes={vec_lanes}: want one of {VEC_LANES_CHOICES}"
         )
 
-    global _LOGITS_KERNEL, _TAIL_KERNEL
-    if _LOGITS_KERNEL is None:
-        _LOGITS_KERNEL = mx.fast.metal_kernel(
-            name="mtplx_qwen4_m4_route_logits",
-            input_names=[
-                "x",
-                "router_weights",
-                "router_scales",
-                "router_biases",
-                "gate_weights",
-                "gate_scales",
-                "gate_biases",
-            ],
-            output_names=["logits", "shared_logits"],
-            header=_LOGITS_HEADER,
-            source=_LOGITS_SOURCE,
-            ensure_row_contiguous=True,
-        )
-    if _TAIL_KERNEL is None:
-        _TAIL_KERNEL = mx.fast.metal_kernel(
-            name="mtplx_qwen4_m4_route_tail",
-            input_names=["logits", "shared_logits"],
-            output_names=["expert_ids", "route_scores", "shared_factor"],
-            header=_TAIL_HEADER,
-            source=_TAIL_SOURCE,
-            ensure_row_contiguous=True,
-        )
-    logits_kernel = _LOGITS_KERNEL
-    tail_kernel = _TAIL_KERNEL
     logits_grid, logits_threadgroup = logits_geometry(vec_lanes)
     tail_grid, tail_threadgroup = tail_geometry()
+
+    def _kernels(dtype):
+        kernels = _KERNELS.get(dtype)
+        if kernels is None:
+            logits_kernel = mx.fast.metal_kernel(
+                name="mtplx_qwen4_m4_route_logits" + kernel_suffix(dtype),
+                input_names=[
+                    "x",
+                    "router_weights",
+                    "router_scales",
+                    "router_biases",
+                    "gate_weights",
+                    "gate_scales",
+                    "gate_biases",
+                ],
+                output_names=["logits", "shared_logits"],
+                header=specialize(_LOGITS_HEADER, dtype),
+                source=specialize(_LOGITS_SOURCE, dtype),
+                ensure_row_contiguous=True,
+            )
+            tail_kernel = mx.fast.metal_kernel(
+                name="mtplx_qwen4_m4_route_tail" + kernel_suffix(dtype),
+                input_names=["logits", "shared_logits"],
+                output_names=["expert_ids", "route_scores", "shared_factor"],
+                header=specialize(_TAIL_HEADER, dtype),
+                source=specialize(_TAIL_SOURCE, dtype),
+                ensure_row_contiguous=True,
+            )
+            kernels = (logits_kernel, tail_kernel)
+            _KERNELS[dtype] = kernels
+        return kernels
 
     def route(
         x,
@@ -660,6 +670,8 @@ def bind(vec_lanes: int = DEFAULT_VEC_LANES) -> Callable[..., tuple]:
         gate_scales,
         gate_biases,
     ):
+        dtype = x.dtype
+        logits_kernel, tail_kernel = _kernels(dtype)
         logits, shared_logits = logits_kernel(
             inputs=[
                 x,
@@ -674,14 +686,14 @@ def bind(vec_lanes: int = DEFAULT_VEC_LANES) -> Callable[..., tuple]:
             grid=logits_grid,
             threadgroup=logits_threadgroup,
             output_shapes=[(ROWS, NUM_EXPERTS), (ROWS,)],
-            output_dtypes=[mx.bfloat16, mx.bfloat16],
+            output_dtypes=[dtype, dtype],
         )
         expert_ids, route_scores, shared_factor = tail_kernel(
             inputs=[logits, shared_logits],
             grid=tail_grid,
             threadgroup=tail_threadgroup,
             output_shapes=[(ROWS, TOP_K), (ROWS, TOP_K), (ROWS,)],
-            output_dtypes=[mx.uint32, mx.bfloat16, mx.bfloat16],
+            output_dtypes=[mx.uint32, dtype, dtype],
         )
         return expert_ids, route_scores, shared_factor
 
@@ -706,8 +718,8 @@ def stock_route(block: Any, x: mx.array) -> tuple:
     shared_factor = mx.sigmoid(block.shared_expert_gate(x)).reshape(ROWS)
     return (
         expert_ids.reshape(ROWS, TOP_K),
-        route_scores.reshape(ROWS, TOP_K).astype(mx.bfloat16),
-        shared_factor.astype(mx.bfloat16),
+        route_scores.reshape(ROWS, TOP_K).astype(x.dtype),
+        shared_factor.astype(x.dtype),
     )
 
 
@@ -729,8 +741,8 @@ def metal_order_reference(block: Any, x: mx.array) -> tuple:
     shared_factor = mx.sigmoid(block.shared_expert_gate(x)).reshape(ROWS)
     return (
         expert_ids.reshape(ROWS, TOP_K).astype(mx.uint32),
-        route_scores.reshape(ROWS, TOP_K).astype(mx.bfloat16),
-        shared_factor.astype(mx.bfloat16),
+        route_scores.reshape(ROWS, TOP_K).astype(x.dtype),
+        shared_factor.astype(x.dtype),
     )
 
 

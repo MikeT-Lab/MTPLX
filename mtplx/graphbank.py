@@ -1046,11 +1046,11 @@ class TensorOffsetQSACache:
             if (
                 tuple(kv.keys.shape) != expected_shape
                 or tuple(kv.values.shape) != expected_shape
-                or kv.keys.dtype != mx.bfloat16
-                or kv.values.dtype != mx.bfloat16
+                or kv.keys.dtype not in (mx.bfloat16, mx.float16)
+                or kv.values.dtype != kv.keys.dtype
             ):
                 raise RuntimeError(
-                    "QSA fused K/V gather requires BF16 "
+                    "QSA fused K/V gather requires BF16 or FP16 "
                     "[1,2,capacity,256] cache ownership"
                 )
             if rows_gather:

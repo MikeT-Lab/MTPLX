@@ -72,7 +72,9 @@ def combine_eligible(y_sorted, inv_order, scores, shared) -> bool:
         return False
     if y_sorted.ndim != 2 or inv_order.ndim != 1 or scores.ndim != 2 or shared.ndim != 2:
         return False
-    if y_sorted.dtype != mx.bfloat16 or scores.dtype != mx.bfloat16 or shared.dtype != mx.bfloat16:
+    if y_sorted.dtype not in (mx.bfloat16, mx.float16):
+        return False
+    if scores.dtype != y_sorted.dtype or shared.dtype != y_sorted.dtype:
         return False
     if inv_order.dtype not in (mx.uint32, mx.int32):
         return False
@@ -153,10 +155,10 @@ def _launch(y_sorted, inv_order, scores, shared):
     total = rows * hidden
     (out,) = _kernel(top_k, hidden)(
         inputs=[y_sorted, inv_order, scores, shared],
-        template=[("T", mx.bfloat16)],
+        template=[("T", y_sorted.dtype)],
         grid=(total, 1, 1),
         threadgroup=(256 if total >= 256 else 32, 1, 1),
         output_shapes=[(rows, hidden)],
-        output_dtypes=[mx.bfloat16],
+        output_dtypes=[y_sorted.dtype],
     )
     return out

@@ -147,7 +147,7 @@ def test_residual_binding_is_six_input_bf16_construction_callable(
 
         return run
 
-    monkeypatch.setattr(kernel_module, "_RESIDUAL_KERNEL", None)
+    monkeypatch.setattr(kernel_module, "_KERNELS", {})
     monkeypatch.setattr(kernel_module.mx.fast, "metal_kernel", fake_metal_kernel)
     residual_tail = kernel_module.bind_residual_tail()
     inputs = tuple(object() for _ in range(4)) + (
@@ -185,7 +185,7 @@ def test_residual_binding_is_six_input_bf16_construction_callable(
             lambda layer: setattr(
                 layer.mlp_hyper_connection.block_inject_weight.weight,
                 "dtype",
-                mx.float16,
+                mx.float32,
             ),
             "BF16 inject ownership",
         ),
@@ -310,8 +310,7 @@ def test_the_two_dispatch_parent_keeps_its_two_dispatches(monkeypatch) -> None:
 
         return run
 
-    monkeypatch.setattr(kernel_module, "_ROUTED_KERNEL", None)
-    monkeypatch.setattr(kernel_module, "_RESIDUAL_TAIL_KERNEL", None, raising=False)
+    monkeypatch.setattr(kernel_module, "_KERNELS", {})
     monkeypatch.setattr(kernel_module.mx.fast, "metal_kernel", fake_metal_kernel)
     combined = kernel_module.bind_residual_tail_two_dispatch()
     routed_inputs = tuple(object() for _ in range(6))
@@ -371,7 +370,7 @@ def test_routed_residual_binding_is_one_dispatch(monkeypatch) -> None:
 
         return run
 
-    monkeypatch.setattr(kernel_module, "_PARALLEL_RESIDUAL_KERNEL", None)
+    monkeypatch.setattr(kernel_module, "_KERNELS", {})
     monkeypatch.setattr(kernel_module.mx.fast, "metal_kernel", fake_metal_kernel)
     combined = kernel_module.bind_residual_tail()
     routed_inputs = tuple(object() for _ in range(6))

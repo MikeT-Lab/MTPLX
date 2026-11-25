@@ -13,6 +13,8 @@ from typing import Any, Callable
 
 import mlx.core as mx
 
+from .qwen4_stream_dtype import kernel_suffix, specialize
+
 
 ROWS = 4
 TOP_K = 10
@@ -22,7 +24,8 @@ THREADS = 64
 OUTPUTS_PER_SIMD = 4
 OUTPUTS_PER_THREADGROUP = 8
 
-_KERNEL: Any | None = None
+#: Compiled kernel per stream dtype; BF16 keeps the original name.
+_KERNELS: dict[Any, Any] = {}
 
 
 _HEADER = f"""
@@ -184,32 +187,35 @@ def launch_geometry() -> tuple[tuple[int, int, int], tuple[int, int, int]]:
 def bind() -> Callable[..., mx.array]:
     """Bind the construction-validated paired routed-GU producer."""
 
-    global _KERNEL
-    if _KERNEL is None:
-        _KERNEL = mx.fast.metal_kernel(
-            name="mtplx_qwen4_m4_paired_routed_glu",
-            input_names=[
-                "value",
-                "weights",
-                "scales",
-                "biases",
-                "expert_ids",
-            ],
-            output_names=["routed_h"],
-            header=_HEADER,
-            source=_SOURCE,
-            ensure_row_contiguous=True,
-        )
-    kernel = _KERNEL
     grid, threadgroup = launch_geometry()
 
+    def _kernel(dtype):
+        kernel = _KERNELS.get(dtype)
+        if kernel is None:
+            kernel = mx.fast.metal_kernel(
+                name="mtplx_qwen4_m4_paired_routed_glu" + kernel_suffix(dtype),
+                input_names=[
+                    "value",
+                    "weights",
+                    "scales",
+                    "biases",
+                    "expert_ids",
+                ],
+                output_names=["routed_h"],
+                header=specialize(_HEADER, dtype),
+                source=specialize(_SOURCE, dtype),
+                ensure_row_contiguous=True,
+            )
+            _KERNELS[dtype] = kernel
+        return kernel
+
     def routed_glu(value, weights, scales, biases, expert_ids):
-        (routed_h,) = kernel(
+        (routed_h,) = _kernel(value.dtype)(
             inputs=[value, weights, scales, biases, expert_ids],
             grid=grid,
             threadgroup=threadgroup,
             output_shapes=[(ROWS, TOP_K, INTERMEDIATE)],
-            output_dtypes=[mx.bfloat16],
+            output_dtypes=[value.dtype],
         )
         return routed_h
 

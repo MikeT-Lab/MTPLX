@@ -157,7 +157,7 @@ def test_m4_routed_down_reduce_bypasses_only_stock_routed_down() -> None:
     assert "routed.down_proj.weight" in forward_source
     assert "shared.down_proj(" in forward_source
     assert "mx.sigmoid(block.shared_expert_gate(x))" in forward_source
-    assert "route_scores.reshape(4, 10).astype(mx.bfloat16)" in forward_source
+    assert "route_scores.reshape(4, 10).astype(x.dtype)" in forward_source
 
 
 def test_m4_routed_down_reduce_routes_only_physical_m4(monkeypatch) -> None:
@@ -484,7 +484,10 @@ def test_m4_stage3_requires_bf16_hidden_input_ownership() -> None:
         )
     )
     stage3_module._validate_input_contract(layer, index=7)
+    # FP16 packs (M1/M2) are admitted; any other type is not.
     layer.mlp_hyper_connection.hc_norm.weight.dtype = mx.float16
+    stage3_module._validate_input_contract(layer, index=7)
+    layer.mlp_hyper_connection.hc_norm.weight.dtype = mx.float32
     with pytest.raises(ValueError, match="BF16 hidden input"):
         stage3_module._validate_input_contract(layer, index=7)
 

@@ -6,6 +6,8 @@ from typing import Any, Callable
 
 import mlx.core as mx
 
+from .qwen4_stream_dtype import kernel_suffix, specialize
+
 
 ROWS = 4
 TOP_K = 10
@@ -14,10 +16,22 @@ HIDDEN = 2560
 THREADS = 64
 OUTPUTS_PER_THREADGROUP = 8
 
-_ROUTED_KERNEL: Any | None = None
-_TAIL_KERNEL: Any | None = None
-_RESIDUAL_TAIL_KERNEL: Any | None = None
-_PARALLEL_RESIDUAL_KERNEL: Any | None = None
+#: Compiled kernels per (kernel, stream dtype); BF16 keeps the original names.
+_KERNELS: dict[tuple[str, Any], Any] = {}
+
+
+def _kernel(name: str, dtype, **spec):
+    key = (name, dtype)
+    kernel = _KERNELS.get(key)
+    if kernel is None:
+        if "header" in spec:
+            spec["header"] = specialize(spec["header"], dtype)
+        spec["source"] = specialize(spec["source"], dtype)
+        kernel = mx.fast.metal_kernel(
+            name=name + kernel_suffix(dtype), ensure_row_contiguous=True, **spec
+        )
+        _KERNELS[key] = kernel
+    return kernel
 
 
 _HEADER = f"""
@@ -420,37 +434,6 @@ def launch_geometry() -> tuple[tuple[int, int, int], tuple[int, int, int]]:
 def bind() -> Callable[..., mx.array]:
     """Bind the routed-only reduction and separate shared-add tail."""
 
-    global _ROUTED_KERNEL, _TAIL_KERNEL
-    if _ROUTED_KERNEL is None:
-        _ROUTED_KERNEL = mx.fast.metal_kernel(
-            name="mtplx_qwen4_m4_routed_down_reduce",
-            input_names=[
-                "routed_h",
-                "weights",
-                "scales",
-                "biases",
-                "expert_ids",
-                "route_scores",
-            ],
-            output_names=["routed_down"],
-            header=_HEADER,
-            source=_ROUTED_SOURCE,
-            ensure_row_contiguous=True,
-        )
-    if _TAIL_KERNEL is None:
-        _TAIL_KERNEL = mx.fast.metal_kernel(
-            name="mtplx_qwen4_m4_routed_shared_tail",
-            input_names=[
-                "routed_down",
-                "shared_down",
-                "shared_factor",
-            ],
-            output_names=["output"],
-            source=_TAIL_SOURCE,
-            ensure_row_contiguous=True,
-        )
-    routed_kernel = _ROUTED_KERNEL
-    tail_kernel = _TAIL_KERNEL
     grid, threadgroup = launch_geometry()
 
     def routed_down_reduce(
@@ -463,6 +446,33 @@ def bind() -> Callable[..., mx.array]:
         shared_down,
         shared_factor,
     ):
+        dtype = routed_h.dtype
+        routed_kernel = _kernel(
+            "mtplx_qwen4_m4_routed_down_reduce",
+            dtype,
+            input_names=[
+                "routed_h",
+                "weights",
+                "scales",
+                "biases",
+                "expert_ids",
+                "route_scores",
+            ],
+            output_names=["routed_down"],
+            header=_HEADER,
+            source=_ROUTED_SOURCE,
+        )
+        tail_kernel = _kernel(
+            "mtplx_qwen4_m4_routed_shared_tail",
+            dtype,
+            input_names=[
+                "routed_down",
+                "shared_down",
+                "shared_factor",
+            ],
+            output_names=["output"],
+            source=_TAIL_SOURCE,
+        )
         (routed_down,) = routed_kernel(
             inputs=[
                 routed_h,
@@ -475,14 +485,14 @@ def bind() -> Callable[..., mx.array]:
             grid=grid,
             threadgroup=threadgroup,
             output_shapes=[(ROWS, HIDDEN)],
-            output_dtypes=[mx.bfloat16],
+            output_dtypes=[dtype],
         )
         (output,) = tail_kernel(
             inputs=[routed_down, shared_down, shared_factor],
             grid=(ROWS * HIDDEN, 1, 1),
             threadgroup=(256, 1, 1),
             output_shapes=[(ROWS, HIDDEN)],
-            output_dtypes=[mx.bfloat16],
+            output_dtypes=[dtype],
         )
         return output
 
@@ -497,10 +507,24 @@ def bind_residual_tail() -> Callable[..., mx.array]:
     slot passes per simdgroup.
     """
 
-    global _PARALLEL_RESIDUAL_KERNEL
-    if _PARALLEL_RESIDUAL_KERNEL is None:
-        _PARALLEL_RESIDUAL_KERNEL = mx.fast.metal_kernel(
-            name="mtplx_qwen4_m4_routed_down_parallel_residual_tail",
+    grid, threadgroup = parallel_launch_geometry()
+
+    def routed_down_residual_tail(
+        routed_h,
+        weights,
+        scales,
+        biases,
+        expert_ids,
+        route_scores,
+        shared_down,
+        shared_factor,
+        hyper,
+        inject,
+    ):
+        dtype = hyper.dtype
+        kernel = _kernel(
+            "mtplx_qwen4_m4_routed_down_parallel_residual_tail",
+            dtype,
             input_names=[
                 "routed_h",
                 "weights",
@@ -516,23 +540,7 @@ def bind_residual_tail() -> Callable[..., mx.array]:
             output_names=["output"],
             header=_HEADER,
             source=_PARALLEL_RESIDUAL_SOURCE,
-            ensure_row_contiguous=True,
         )
-    kernel = _PARALLEL_RESIDUAL_KERNEL
-    grid, threadgroup = parallel_launch_geometry()
-
-    def routed_down_residual_tail(
-        routed_h,
-        weights,
-        scales,
-        biases,
-        expert_ids,
-        route_scores,
-        shared_down,
-        shared_factor,
-        hyper,
-        inject,
-    ):
         (output,) = kernel(
             inputs=[
                 routed_h,
@@ -549,7 +557,7 @@ def bind_residual_tail() -> Callable[..., mx.array]:
             grid=grid,
             threadgroup=threadgroup,
             output_shapes=[(ROWS, 4 * HIDDEN)],
-            output_dtypes=[mx.bfloat16],
+            output_dtypes=[dtype],
         )
         return output.reshape(*hyper.shape)
 
@@ -559,39 +567,6 @@ def bind_residual_tail() -> Callable[..., mx.array]:
 def bind_residual_tail_two_dispatch() -> Callable[..., mx.array]:
     """The two-dispatch spelling of ``bind_residual_tail`` (its parent)."""
 
-    global _ROUTED_KERNEL, _RESIDUAL_TAIL_KERNEL
-    if _ROUTED_KERNEL is None:
-        _ROUTED_KERNEL = mx.fast.metal_kernel(
-            name="mtplx_qwen4_m4_routed_down_reduce",
-            input_names=[
-                "routed_h",
-                "weights",
-                "scales",
-                "biases",
-                "expert_ids",
-                "route_scores",
-            ],
-            output_names=["routed_down"],
-            header=_HEADER,
-            source=_ROUTED_SOURCE,
-            ensure_row_contiguous=True,
-        )
-    if _RESIDUAL_TAIL_KERNEL is None:
-        _RESIDUAL_TAIL_KERNEL = mx.fast.metal_kernel(
-            name="mtplx_qwen4_m4_routed_shared_residual_tail",
-            input_names=[
-                "routed_down",
-                "shared_down",
-                "shared_factor",
-                "hyper",
-                "inject",
-            ],
-            output_names=["output"],
-            source=_RESIDUAL_TAIL_SOURCE,
-            ensure_row_contiguous=True,
-        )
-    routed_kernel = _ROUTED_KERNEL
-    residual_tail_kernel = _RESIDUAL_TAIL_KERNEL
     grid, threadgroup = launch_geometry()
 
     def routed_down_residual_tail(
@@ -606,6 +581,35 @@ def bind_residual_tail_two_dispatch() -> Callable[..., mx.array]:
         hyper,
         inject,
     ):
+        dtype = hyper.dtype
+        routed_kernel = _kernel(
+            "mtplx_qwen4_m4_routed_down_reduce",
+            dtype,
+            input_names=[
+                "routed_h",
+                "weights",
+                "scales",
+                "biases",
+                "expert_ids",
+                "route_scores",
+            ],
+            output_names=["routed_down"],
+            header=_HEADER,
+            source=_ROUTED_SOURCE,
+        )
+        residual_tail_kernel = _kernel(
+            "mtplx_qwen4_m4_routed_shared_residual_tail",
+            dtype,
+            input_names=[
+                "routed_down",
+                "shared_down",
+                "shared_factor",
+                "hyper",
+                "inject",
+            ],
+            output_names=["output"],
+            source=_RESIDUAL_TAIL_SOURCE,
+        )
         (routed_down,) = routed_kernel(
             inputs=[
                 routed_h,
@@ -618,14 +622,14 @@ def bind_residual_tail_two_dispatch() -> Callable[..., mx.array]:
             grid=grid,
             threadgroup=threadgroup,
             output_shapes=[(ROWS, HIDDEN)],
-            output_dtypes=[mx.bfloat16],
+            output_dtypes=[dtype],
         )
         (output,) = residual_tail_kernel(
             inputs=[routed_down, shared_down, shared_factor, hyper, inject],
             grid=(ROWS * HIDDEN, 1, 1),
             threadgroup=(256, 1, 1),
             output_shapes=[(ROWS, 4 * HIDDEN)],
-            output_dtypes=[mx.bfloat16],
+            output_dtypes=[dtype],
         )
         return output.reshape(*hyper.shape)
 

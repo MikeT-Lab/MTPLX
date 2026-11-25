@@ -207,8 +207,8 @@ def _m4_forward(block: SparseMoeBlock, x: mx.array, stage3) -> mx.array:
     output = stage3(
         routed_down,
         shared_down,
-        route_scores.reshape(4, 10).astype(mx.bfloat16),
-        shared_factor.astype(mx.bfloat16),
+        route_scores.reshape(4, 10).astype(x.dtype),
+        shared_factor.astype(x.dtype),
     )
     return output.reshape(x.shape).astype(x.dtype)
 
@@ -257,9 +257,9 @@ def _m4_routed_down_reduce_forward(
         routed.down_proj.scales,
         routed.down_proj.biases,
         expert_ids.reshape(4, 10),
-        route_scores.reshape(4, 10).astype(mx.bfloat16),
+        route_scores.reshape(4, 10).astype(x.dtype),
         shared_down,
-        shared_factor.astype(mx.bfloat16),
+        shared_factor.astype(x.dtype),
     )
     return output.reshape(x.shape).astype(x.dtype)
 
@@ -310,9 +310,9 @@ def _m4_routed_down_residual_tail_forward(
         routed.down_proj.scales,
         routed.down_proj.biases,
         expert_ids.reshape(4, 10),
-        route_scores.reshape(4, 10).astype(mx.bfloat16),
+        route_scores.reshape(4, 10).astype(x.dtype),
         shared_down,
-        shared_factor.astype(mx.bfloat16),
+        shared_factor.astype(x.dtype),
         hyper,
         inject,
     )
@@ -394,9 +394,9 @@ def _m4_paired_routed_glu_residual_tail_forward(
         routed.down_proj.scales,
         routed.down_proj.biases,
         expert_ids,
-        route_scores.astype(mx.bfloat16),
+        route_scores.astype(x.dtype),
         shared_down,
-        shared_factor.astype(mx.bfloat16),
+        shared_factor.astype(x.dtype),
         hyper,
         inject,
     )
@@ -616,6 +616,15 @@ _SHARED_DOWN_CONTRACT = (
 )
 
 
+_STREAM_DTYPES = (mx.bfloat16, mx.float16)
+
+
+def _contract_for(contract: tuple, dtype) -> tuple:
+    """A BF16 contract restated for the pack's 16-bit type (FP16 packs on M1/M2)."""
+
+    return tuple(dtype if item is mx.bfloat16 else item for item in contract)
+
+
 def _validate_layer_owner(layer: Any, *, index: int) -> None:
     if type(layer) is not DecoderLayer:
         raise ValueError(f"qwen4 M4 stage3 layer {index} has wrong decoder owner")
@@ -633,21 +642,24 @@ def _validate_block_contract(block: Any, *, index: int) -> None:
         raise ValueError(f"{label} requires top-k probability normalization")
     if block.sharding_group is not None:
         raise ValueError(f"{label} does not support sharding")
+    dtype = getattr(getattr(block.gate, "scales", None), "dtype", mx.bfloat16)
+    if dtype not in _STREAM_DTYPES:
+        dtype = mx.bfloat16
     if type(block.switch_mlp) is not _FusedGateUpSwitchGLU:
         raise ValueError(f"{label} lacks exact routed fused GU owner")
     if type(block.shared_expert) is not _FusedGateUpMLP:
         raise ValueError(f"{label} lacks exact shared fused GU owner")
-    if _projection_contract(block.gate) != _ROUTER_CONTRACT:
+    if _projection_contract(block.gate) != _contract_for(_ROUTER_CONTRACT, dtype):
         raise ValueError(f"{label} router mismatch")
-    if _projection_contract(block.shared_expert_gate) != _SHARED_GATE_CONTRACT:
+    if _projection_contract(block.shared_expert_gate) != _contract_for(_SHARED_GATE_CONTRACT, dtype):
         raise ValueError(f"{label} shared gate mismatch")
-    if _fused_gu_contract(block.switch_mlp) != _ROUTED_GU_CONTRACT:
+    if _fused_gu_contract(block.switch_mlp) != _contract_for(_ROUTED_GU_CONTRACT, dtype):
         raise ValueError(f"{label} routed fused GU mismatch")
-    if _fused_gu_contract(block.shared_expert) != _SHARED_GU_CONTRACT:
+    if _fused_gu_contract(block.shared_expert) != _contract_for(_SHARED_GU_CONTRACT, dtype):
         raise ValueError(f"{label} shared fused GU mismatch")
-    if _projection_contract(block.switch_mlp.down_proj) != _ROUTED_DOWN_CONTRACT:
+    if _projection_contract(block.switch_mlp.down_proj) != _contract_for(_ROUTED_DOWN_CONTRACT, dtype):
         raise ValueError(f"{label} routed down mismatch")
-    if _projection_contract(block.shared_expert.down_proj) != _SHARED_DOWN_CONTRACT:
+    if _projection_contract(block.shared_expert.down_proj) != _contract_for(_SHARED_DOWN_CONTRACT, dtype):
         raise ValueError(f"{label} shared down mismatch")
 
 
@@ -657,10 +669,10 @@ def _validate_input_contract(layer: Any, *, index: int) -> None:
     if (
         weight is None
         or tuple(weight.shape) != (4 * 2560,)
-        or weight.dtype != mx.bfloat16
+        or weight.dtype not in _STREAM_DTYPES
     ):
         raise ValueError(
-            f"qwen4 M4 stage3 layer {index} requires BF16 hidden input ownership"
+            f"qwen4 M4 stage3 layer {index} requires BF16 hidden input ownership (FP16 on FP16 packs)"
         )
 
 
@@ -680,9 +692,9 @@ def _validate_residual_tail_contract(layer: Any, *, index: int) -> None:
     if (
         inject_weight is None
         or tuple(inject_weight.shape) != (4, 4 * 2560)
-        or inject_weight.dtype != mx.bfloat16
+        or inject_weight.dtype not in _STREAM_DTYPES
     ):
-        raise ValueError(f"{label} requires BF16 inject ownership")
+        raise ValueError(f"{label} requires BF16 inject ownership (FP16 on FP16 packs)")
 
 
 def bind_qwen4_m4_residual_tail(layer: Any, *, index: int):
@@ -862,8 +874,13 @@ def install_qwen4_m4_stage3(
         for layer, block, _, _ in validated_plans
     )
 
+    stream_dtype = mx.bfloat16
+    if plans:
+        candidate_dtype = getattr(plans[0][1].gate.scales, "dtype", mx.bfloat16)
+        if candidate_dtype in _STREAM_DTYPES:
+            stream_dtype = candidate_dtype
     sample = mx.sin(mx.arange(4 * 2560, dtype=mx.float32) * 0.0009765625)
-    sample = sample.reshape(1, 4, 2560).astype(mx.bfloat16)
+    sample = sample.reshape(1, 4, 2560).astype(stream_dtype)
     max_delta = 0.0
     for index, (layer, block, stage3, routed_down_reduce) in enumerate(plans):
         if route is not None:
@@ -898,10 +915,10 @@ def install_qwen4_m4_stage3(
         if routed_down_residual_tail_enabled:
             hyper = mx.sin(
                 mx.arange(4 * 4 * 2560, dtype=mx.float32) * 0.000244140625
-            ).reshape(1, 4, 4 * 2560).astype(mx.bfloat16)
+            ).reshape(1, 4, 4 * 2560).astype(stream_dtype)
             inject = mx.cos(
                 mx.arange(4 * 4, dtype=mx.float32) * 0.0625
-            ).reshape(1, 4, 4).astype(mx.bfloat16)
+            ).reshape(1, 4, 4).astype(stream_dtype)
             candidate = (
                 _m4_paired_routed_glu_residual_tail_forward(
                     block,

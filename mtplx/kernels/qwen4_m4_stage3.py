@@ -6,14 +6,31 @@ from typing import Any, Callable
 
 import mlx.core as mx
 
+from .qwen4_stream_dtype import kernel_suffix, specialize
+
 
 ROWS = 4
 HIDDEN = 2560
 TOP_K = 10
 THREADS = 256
 
-_KERNEL: Any | None = None
-_RESIDUAL_KERNEL: Any | None = None
+#: Compiled kernels per (kernel, stream dtype); BF16 keeps the original names.
+_KERNELS: dict[tuple[str, Any], Any] = {}
+
+
+def _kernel(name: str, dtype, *, input_names, source_text):
+    key = (name, dtype)
+    kernel = _KERNELS.get(key)
+    if kernel is None:
+        kernel = mx.fast.metal_kernel(
+            name=name + kernel_suffix(dtype),
+            input_names=input_names,
+            output_names=["output"],
+            source=specialize(source_text, dtype),
+            ensure_row_contiguous=True,
+        )
+        _KERNELS[key] = kernel
+    return kernel
 
 
 def source() -> str:
@@ -91,30 +108,27 @@ def residual_launch_geometry() -> tuple[
 
 
 def bind() -> Callable[[Any, Any, Any, Any], mx.array]:
-    global _KERNEL
-    if _KERNEL is None:
-        _KERNEL = mx.fast.metal_kernel(
-            name="mtplx_qwen4_m4_combine_tail",
+    grid, threadgroup = launch_geometry()
+
+    def combine(routed_down, shared_down, route_scores, shared_factor):
+        dtype = routed_down.dtype
+        kernel = _kernel(
+            "mtplx_qwen4_m4_combine_tail",
+            dtype,
             input_names=[
                 "routed_down",
                 "shared_down",
                 "route_scores",
                 "shared_factor",
             ],
-            output_names=["output"],
-            source=source(),
-            ensure_row_contiguous=True,
+            source_text=source(),
         )
-    kernel = _KERNEL
-    grid, threadgroup = launch_geometry()
-
-    def combine(routed_down, shared_down, route_scores, shared_factor):
         (output,) = kernel(
             inputs=[routed_down, shared_down, route_scores, shared_factor],
             grid=grid,
             threadgroup=threadgroup,
             output_shapes=[(ROWS, HIDDEN)],
-            output_dtypes=[mx.bfloat16],
+            output_dtypes=[dtype],
         )
         return output
 
@@ -122,25 +136,8 @@ def bind() -> Callable[[Any, Any, Any, Any], mx.array]:
 
 
 def bind_residual_tail() -> Callable[[Any, Any, Any, Any, Any, Any], mx.array]:
-    """Bind the physical-M4 combine plus exact BF16 decoder residual store."""
+    """Bind the physical-M4 combine plus exact decoder residual store (BF16 or FP16 stream)."""
 
-    global _RESIDUAL_KERNEL
-    if _RESIDUAL_KERNEL is None:
-        _RESIDUAL_KERNEL = mx.fast.metal_kernel(
-            name="mtplx_qwen4_m4_combine_residual_tail",
-            input_names=[
-                "routed_down",
-                "shared_down",
-                "route_scores",
-                "shared_factor",
-                "hyper",
-                "inject",
-            ],
-            output_names=["output"],
-            source=residual_source(),
-            ensure_row_contiguous=True,
-        )
-    kernel = _RESIDUAL_KERNEL
     grid, threadgroup = residual_launch_geometry()
 
     def residual_tail(
@@ -151,6 +148,20 @@ def bind_residual_tail() -> Callable[[Any, Any, Any, Any, Any, Any], mx.array]:
         hyper,
         inject,
     ):
+        dtype = hyper.dtype
+        kernel = _kernel(
+            "mtplx_qwen4_m4_combine_residual_tail",
+            dtype,
+            input_names=[
+                "routed_down",
+                "shared_down",
+                "route_scores",
+                "shared_factor",
+                "hyper",
+                "inject",
+            ],
+            source_text=residual_source(),
+        )
         (output,) = kernel(
             inputs=[
                 routed_down,
@@ -163,7 +174,7 @@ def bind_residual_tail() -> Callable[[Any, Any, Any, Any, Any, Any], mx.array]:
             grid=grid,
             threadgroup=threadgroup,
             output_shapes=[(ROWS, 4 * HIDDEN)],
-            output_dtypes=[mx.bfloat16],
+            output_dtypes=[dtype],
         )
         return output.reshape(*hyper.shape)
 

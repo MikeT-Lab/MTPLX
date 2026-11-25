@@ -225,13 +225,18 @@ def _build_fixed_m4_compiled_verify_aux(self: Any, cache, prompt_ids):
                 for name in ("weight", "scales", "biases")
             ),
         )
+        # The 16-bit metadata type is BF16, or F16 on the FP16 packs (M1/M2); the
+        # sidecar decodes both (``_maps`` dtype), scales and biases share it.
+        meta_dtype = sidecar._maps["scales"][1]
+        if meta_dtype not in ("BF16", "F16"):
+            meta_dtype = "BF16"
         expected_storage = (
             4,
             32,
             (
                 ("weight", (20,), "U32"),
-                ("scales", (5,), "BF16"),
-                ("biases", (5,), "BF16"),
+                ("scales", (5,), meta_dtype),
+                ("biases", (5,), meta_dtype),
             ),
         )
         if storage != expected_storage:
